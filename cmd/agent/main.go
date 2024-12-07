@@ -31,7 +31,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/resolver"
 
 	"github.com/nezhahq/agent/cmd/agent/commands"
@@ -47,15 +46,23 @@ import (
 )
 
 var (
-	version           = monitor.Version // 来自于 GoReleaser 的版本号
-	arch              string
-	executablePath    string
-	defaultConfigPath = loadDefaultConfigPath()
-	client            pb.NezhaServiceClient
-	initialized       bool
-	dnsResolver       = &net.Resolver{PreferGo: true}
-	agentConfig       model.AgentConfig
-	httpClient        = &http.Client{
+	version               = monitor.Version // 来自于 GoReleaser 的版本号
+	arch                  string
+	executablePath        string
+	defaultConfigPath     = loadDefaultConfigPath()
+	client                pb.NezhaServiceClient
+	initialized           bool
+	agentConfig           model.AgentConfig
+	prevDashboardBootTime uint64 // 面板上次启动时间
+	geoipReported         bool   // 在面板重启后是否上报成功过 GeoIP
+	lastReportHostInfo    time.Time
+	lastReportIPInfo      time.Time
+
+	hostStatus = new(atomic.Bool)
+	ipStatus   = new(atomic.Bool)
+
+	dnsResolver = &net.Resolver{PreferGo: true}
+	httpClient  = &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -68,9 +75,6 @@ var (
 		Timeout:   time.Second * 30,
 		Transport: &http3.RoundTripper{},
 	}
-
-	hostStatus = new(atomic.Bool)
-	ipStatus   = new(atomic.Bool)
 )
 
 var (
@@ -81,6 +85,8 @@ var (
 const (
 	delayWhenError = time.Second * 10 // Agent 重连间隔
 	networkTimeOut = time.Second * 5  // 普通网络超时
+
+	binaryName = "nezha-agent"
 )
 
 func setEnv() {
@@ -251,6 +257,7 @@ func run() {
 	}
 
 	var err error
+	var dashboardBootTimeReceipt *pb.Uint64Receipt
 	var conn *grpc.ClientConn
 
 	retry := func() {
@@ -274,20 +281,16 @@ func run() {
 		} else {
 			securityOption = grpc.WithTransportCredentials(insecure.NewCredentials())
 		}
-		conn, err = grpc.NewClient(agentConfig.Server, securityOption, grpc.WithKeepaliveParams(
-			keepalive.ClientParameters{
-				Time:                time.Second * 30,
-				PermitWithoutStream: true,
-			}), grpc.WithPerRPCCredentials(&auth))
+		conn, err = grpc.NewClient(agentConfig.Server, securityOption, grpc.WithPerRPCCredentials(&auth))
 		if err != nil {
 			printf("与面板建立连接失败: %v", err)
 			retry()
 			continue
 		}
 		client = pb.NewNezhaServiceClient(conn)
-		// 第一步注册
+
 		timeOutCtx, cancel := context.WithTimeout(context.Background(), networkTimeOut)
-		_, err = client.ReportSystemInfo(timeOutCtx, monitor.GetHost().PB())
+		dashboardBootTimeReceipt, err = client.ReportSystemInfo2(timeOutCtx, monitor.GetHost().PB())
 		if err != nil {
 			printf("上报系统信息失败: %v", err)
 			cancel()
@@ -295,18 +298,20 @@ func run() {
 			continue
 		}
 		cancel()
+		geoipReported = geoipReported && prevDashboardBootTime > 0 && dashboardBootTimeReceipt.GetData() == prevDashboardBootTime
+		prevDashboardBootTime = dashboardBootTimeReceipt.GetData()
 		initialized = true
 
 		errCh := make(chan error)
 
 		// 执行 Task
-		tasks, err := client.RequestTask(context.Background(), monitor.GetHost().PB())
+		tasks, err := client.RequestTask(context.Background())
 		if err != nil {
 			printf("请求任务失败: %v", err)
 			retry()
 			continue
 		}
-		go receiveTasks(tasks, errCh)
+		go receiveTasksDaemon(tasks, errCh)
 
 		reportState, err := client.ReportSystemState(context.Background())
 		if err != nil {
@@ -335,10 +340,9 @@ func runService(action string, path string) {
 		"OnFailure": "restart",
 	}
 
-	var args []string
+	args := []string{"-c", path}
 	name := filepath.Base(executablePath)
 	if path != defaultConfigPath && path != "" {
-		args = []string{"-c", path}
 		hex := fmt.Sprintf("%x", md5.Sum([]byte(path)))[:7]
 		name = fmt.Sprintf("%s-%s", name, hex)
 	}
@@ -394,7 +398,7 @@ func runService(action string, path string) {
 	}
 }
 
-func receiveTasks(tasks pb.NezhaService_RequestTaskClient, errCh chan<- error) {
+func receiveTasksDaemon(tasks pb.NezhaService_RequestTaskClient, errCh chan<- error) {
 	var task *pb.Task
 	var err error
 	for {
@@ -403,18 +407,23 @@ func receiveTasks(tasks pb.NezhaService_RequestTaskClient, errCh chan<- error) {
 			errCh <- fmt.Errorf("receiveTasks exit: %v", err)
 			return
 		}
-		go func() {
+		go func(t *pb.Task) {
 			defer func() {
 				if err := recover(); err != nil {
 					println("task panic", task, err)
 				}
 			}()
-			doTask(task)
-		}()
+			result := doTask(t)
+			if result != nil {
+				if err := tasks.Send(result); err != nil {
+					printf("send task result error: %v", err)
+				}
+			}
+		}(task)
 	}
 }
 
-func doTask(task *pb.Task) {
+func doTask(task *pb.Task) *pb.TaskResult {
 	var result pb.TaskResult
 	result.Id = task.GetId()
 	result.Type = task.GetType()
@@ -431,31 +440,25 @@ func doTask(task *pb.Task) {
 		handleUpgradeTask(task, &result)
 	case model.TaskTypeTerminalGRPC:
 		handleTerminalTask(task)
-		return
+		return nil
 	case model.TaskTypeNAT:
 		handleNATTask(task)
-		return
-	case model.TaskTypeReportHostInfo:
-		reportHost()
-		monitor.GeoQueryIPChanged = true
-		reportGeoIP(agentConfig.UseIPv6CountryCode)
-		return
+		return nil
 	case model.TaskTypeFM:
 		handleFMTask(task)
-		return
+		return nil
+	case model.TaskTypeKeepalive:
 	default:
 		printf("不支持的任务: %v", task)
-		return
+		return nil
 	}
-	client.ReportTask(context.Background(), &result)
+	return &result
 }
 
 // reportStateDaemon 向server上报状态信息
 func reportStateDaemon(stateClient pb.NezhaService_ReportSystemStateClient, errCh chan<- error) {
-	var lastReportHostInfo, lastReportIPInfo time.Time
 	var err error
 	for {
-		// 为了更准确的记录时段流量，inited 后再上传状态信息
 		lastReportHostInfo, lastReportIPInfo, err = reportState(stateClient, lastReportHostInfo, lastReportIPInfo)
 		if err != nil {
 			errCh <- fmt.Errorf("reportStateDaemon exit: %v", err)
@@ -466,13 +469,15 @@ func reportStateDaemon(stateClient pb.NezhaService_ReportSystemStateClient, errC
 }
 
 func reportState(statClient pb.NezhaService_ReportSystemStateClient, host, ip time.Time) (time.Time, time.Time, error) {
-	monitor.TrackNetworkSpeed()
-	if err := statClient.Send(monitor.GetState(agentConfig.SkipConnectionCount, agentConfig.SkipProcsCount).PB()); err != nil {
-		return host, ip, err
-	}
-	_, err := statClient.Recv()
-	if err != nil {
-		return host, ip, err
+	if initialized {
+		monitor.TrackNetworkSpeed()
+		if err := statClient.Send(monitor.GetState(agentConfig.SkipConnectionCount, agentConfig.SkipProcsCount).PB()); err != nil {
+			return host, ip, err
+		}
+		_, err := statClient.Recv()
+		if err != nil {
+			return host, ip, err
+		}
 	}
 	// 每10分钟重新获取一次硬件信息
 	if host.Before(time.Now().Add(-10 * time.Minute)) {
@@ -481,9 +486,11 @@ func reportState(statClient pb.NezhaService_ReportSystemStateClient, host, ip ti
 		}
 	}
 	// 更新IP信息
-	if time.Since(ip) > time.Second*time.Duration(agentConfig.IPReportPeriod) {
-		reportGeoIP(agentConfig.UseIPv6CountryCode)
-		ip = time.Now()
+	if time.Since(ip) > time.Second*time.Duration(agentConfig.IPReportPeriod) || !geoipReported {
+		if reportGeoIP(agentConfig.UseIPv6CountryCode, !geoipReported) {
+			ip = time.Now()
+			geoipReported = true
+		}
 	}
 	return host, ip, nil
 }
@@ -495,13 +502,17 @@ func reportHost() bool {
 	defer hostStatus.Store(false)
 
 	if client != nil && initialized {
-		client.ReportSystemInfo(context.Background(), monitor.GetHost().PB())
+		receipt, err := client.ReportSystemInfo2(context.Background(), monitor.GetHost().PB())
+		if err == nil {
+			geoipReported = receipt.GetData() == prevDashboardBootTime
+			prevDashboardBootTime = receipt.GetData()
+		}
 	}
 
 	return true
 }
 
-func reportGeoIP(use6 bool) bool {
+func reportGeoIP(use6, forceUpdate bool) bool {
 	if !ipStatus.CompareAndSwap(false, true) {
 		return false
 	}
@@ -509,14 +520,16 @@ func reportGeoIP(use6 bool) bool {
 
 	if client != nil && initialized {
 		pbg := monitor.FetchIP(use6)
-		if pbg != nil && monitor.GeoQueryIPChanged {
-			geoip, err := client.ReportGeoIP(context.Background(), pbg)
-			if err == nil {
-				monitor.CachedCountryCode = geoip.GetCountryCode()
-				monitor.GeoQueryIPChanged = false
-			}
-		} else {
+		if pbg == nil {
 			return false
+		}
+		if !monitor.GeoQueryIPChanged && !forceUpdate {
+			return true
+		}
+		geoip, err := client.ReportGeoIP(context.Background(), pbg)
+		if err == nil {
+			monitor.CachedCountryCode = geoip.GetCountryCode()
+			monitor.GeoQueryIPChanged = false
 		}
 	}
 
@@ -533,9 +546,23 @@ func doSelfUpdate(useLocalVersion bool) {
 	var latest *selfupdate.Release
 	var err error
 	if monitor.CachedCountryCode != "cn" && !agentConfig.UseGiteeToUpgrade {
-		latest, err = selfupdate.UpdateSelf(v, "nezhahq/agent")
+		updater, erru := selfupdate.NewUpdater(selfupdate.Config{
+			BinaryName: binaryName,
+		})
+		if erru != nil {
+			printf("更新失败: %v", erru)
+			return
+		}
+		latest, err = updater.UpdateSelf(v, "nezhahq/agent")
 	} else {
-		latest, err = selfupdate.UpdateSelfGitee(v, "naibahq/agent")
+		updater, erru := selfupdate.NewGiteeUpdater(selfupdate.Config{
+			BinaryName: binaryName,
+		})
+		if erru != nil {
+			printf("更新失败: %v", erru)
+			return
+		}
+		latest, err = updater.UpdateSelf(v, "naibahq/agent")
 	}
 	if err != nil {
 		printf("更新失败: %v", err)
@@ -592,11 +619,11 @@ func handleIcmpPingTask(task *pb.Task, result *pb.TaskResult) {
 	}
 
 	ipAddr, err := lookupIP(task.GetData())
+	printf("ICMP-Ping Task: Pinging %s(%s)", task.GetData(), ipAddr)
 	if err != nil {
 		result.Data = err.Error()
 		return
 	}
-	printf("ICMP-Ping Task: Pinging %s", ipAddr)
 	pinger, err := ping.NewPinger(ipAddr)
 	if err == nil {
 		pinger.SetPrivileged(true)
@@ -622,10 +649,10 @@ func handleHttpGetTask(task *pb.Task, result *pb.TaskResult) {
 		result.Data = "This server has disabled query sending"
 		return
 	}
-
 	start := time.Now()
 	taskUrl := task.GetData()
 	resp, err := httpClient.Get(taskUrl)
+	printf("HTTP-GET Task: %s", taskUrl)
 	checkHttpResp(taskUrl, start, resp, err, result)
 }
 
@@ -786,6 +813,8 @@ func handleTerminalTask(task *pb.Task) {
 		return
 	}
 
+	go ioStreamKeepAlive(remoteIO)
+
 	tty, err := pty.Start()
 	if err != nil {
 		printf("Terminal pty.Start失败 %v", err)
@@ -800,8 +829,8 @@ func handleTerminalTask(task *pb.Task) {
 	println("terminal init", terminal.StreamID)
 
 	go func() {
+		buf := make([]byte, 10240)
 		for {
-			buf := make([]byte, 10240)
 			read, err := tty.Read(buf)
 			if err != nil {
 				remoteIO.Send(&pb.IOStreamData{Data: []byte(err.Error())})
@@ -818,7 +847,7 @@ func handleTerminalTask(task *pb.Task) {
 			return
 		}
 		if len(remoteData.Data) == 0 {
-			return
+			continue
 		}
 		switch remoteData.Data[0] {
 		case 0:
@@ -861,6 +890,8 @@ func handleNATTask(task *pb.Task) {
 		printf("NAT 发送StreamID失败: %v", err)
 		return
 	}
+
+	go ioStreamKeepAlive(remoteIO)
 
 	conn, err := net.Dial("tcp", nat.Host)
 	if err != nil {
@@ -923,6 +954,8 @@ func handleFMTask(task *pb.Task) {
 		return
 	}
 
+	go ioStreamKeepAlive(remoteIO)
+
 	defer func() {
 		errCloseSend := remoteIO.CloseSend()
 		println("FM exit", fmTask.StreamID, nil, errCloseSend)
@@ -936,7 +969,7 @@ func handleFMTask(task *pb.Task) {
 			return
 		}
 		if len(remoteData.Data) == 0 {
-			return
+			continue
 		}
 		fmc.DoTask(remoteData)
 	}
@@ -966,4 +999,14 @@ func lookupIP(hostOrIp string) (string, error) {
 		return ips[0].IP.String(), nil
 	}
 	return hostOrIp, nil
+}
+
+func ioStreamKeepAlive(stream pb.NezhaService_IOStreamClient) {
+	for {
+		if err := stream.Send(&pb.IOStreamData{Data: []byte{}}); err != nil {
+			printf("IOStream KeepAlive 失败: %v", err)
+			return
+		}
+		time.Sleep(time.Second * 30)
+	}
 }
