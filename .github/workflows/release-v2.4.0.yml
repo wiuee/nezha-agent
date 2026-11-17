@@ -68,8 +68,8 @@ jobs:
             -o "${binary}" ./cmd/agent
 
           build_info="$(go version -m "${binary}")"
-          grep -F "build GOOS=${GOOS}" <<<"${build_info}"
-          grep -F "build GOARCH=${GOARCH}" <<<"${build_info}"
+          grep -E "build[[:space:]]+GOOS=${GOOS}$" <<<"${build_info}"
+          grep -E "build[[:space:]]+GOARCH=${GOARCH}$" <<<"${build_info}"
 
           if [[ "${GOOS}/${GOARCH}" == "linux/amd64" ]]; then
             "${binary}" --version | grep -F "${version}"
