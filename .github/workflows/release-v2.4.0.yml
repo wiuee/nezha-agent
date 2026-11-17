@@ -1,0 +1,122 @@
+name: Release nezha-agent v2.4.0
+
+on:
+  push:
+    branches:
+      - release/v2.4.0
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version
+        required: true
+        default: v2.4.0
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nezha-agent-release-v2.4.0
+  cancel-in-progress: false
+
+env:
+  RELEASE_VERSION: ${{ inputs.version || 'v2.4.0' }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version: ^1.26.1
+          cache: true
+
+      - name: Build and package
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          version="${RELEASE_VERSION#v}"
+          binary="dist/nezha-agent"
+          if [[ "${GOOS}" == "windows" ]]; then
+            binary="${binary}.exe"
+          fi
+
+          go build -mod=readonly -trimpath \
+            -ldflags "-s -w -X github.com/nezhahq/agent/pkg/monitor.Version=${version} -X main.arch=${GOARCH}" \
+            -o "${binary}" ./cmd/agent
+
+          build_info="$(go version -m "${binary}")"
+          grep -F "build GOOS=${GOOS}" <<<"${build_info}"
+          grep -F "build GOARCH=${GOARCH}" <<<"${build_info}"
+
+          if [[ "${GOOS}/${GOARCH}" == "linux/amd64" ]]; then
+            "${binary}" --version | grep -F "${version}"
+          fi
+
+          mkdir -p release
+          archive="release/nezha-agent_${GOOS}_${GOARCH}.zip"
+          zip -j "${archive}" "${binary}" LICENSE
+          zip -T "${archive}"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: nezha-agent_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: release/nezha-agent_${{ matrix.goos }}_${{ matrix.goarch }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish ${{ env.RELEASE_VERSION }}
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: nezha-agent_*
+          path: assets
+          merge-multiple: true
+
+      - name: Verify archives and create checksums
+        working-directory: assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          archives=(./*.zip)
+          test "${#archives[@]}" -eq 4
+          sha256sum "${archives[@]}" > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_VERSION }}
+          target_commitish: ${{ github.sha }}
+          name: nezha-agent ${{ env.RELEASE_VERSION }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            assets/*.zip
+            assets/checksums.txt
